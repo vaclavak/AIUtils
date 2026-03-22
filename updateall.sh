@@ -28,6 +28,9 @@ pip install --upgrade torch transformers bitsandbytes datasets accelerate
 echo "Installing latest PEFT from GitHub..."
 pip install --upgrade git+https://github.com/huggingface/peft.git
 
+echo "Installing unsloth"
+pip install unsloth
+
 echo "Setup complete!"
 echo "Activate your environment with: source lora_env/bin/activate"
 
