@@ -1,101 +1,124 @@
-# train_qwen2.5_lora.py
-
+import os
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_int8_training
-from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
+import json
 
-# ------------------------------
-# 1. Load dataset (subset)
-# ------------------------------
-dataset = load_dataset("open-index/hacker-news", split="train[:10000]")  # 10k lines
+# 1. FORCE PATCH: Must happen BEFORE importing FastLanguageModel
+import unsloth.tokenizer_utils
+unsloth.tokenizer_utils.fix_untrained_tokens = lambda *args, **kwargs: None
 
-# For simplicity, only keep 'text' field
-dataset = dataset.map(lambda x: {"text": x["text"]})
+from unsloth import FastLanguageModel
+from trl import SFTTrainer
+from transformers import TrainingArguments, AutoTokenizer
+from datasets import load_dataset, interleave_datasets, Dataset
 
-# ------------------------------
-# 2. Load tokenizer and model
-# ------------------------------
-model_name = "Qwen/Qwen-2.5-7B-sft"  # change if you have local safetensors
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-tokenizer.pad_token = tokenizer.eos_token
+# --- 1. CONFIGURATION ---
+# Point model_path to your CURRENT John-1.2.1 LoRA folder
+model_path = "/workspace/Qwen2.5/Qwen2.5-7B-Instruct/"
+output_path = "/workspace/output/Qwen2.5-trained"
+max_seq_length = 2048
 
-# Load model in 8-bit for memory efficiency
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    load_in_8bit=True,
-    device_map="auto"
+# --- 2. LOAD MODEL & TOKENIZER ---
+model, _ = FastLanguageModel.from_pretrained(
+    model_name = model_path,
+    max_seq_length = max_seq_length,
+    load_in_4bit = True,
+    dtype = None,
 )
 
-# Prepare model for LoRA
-model = prepare_model_for_int8_training(model)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+EOS_TOKEN = tokenizer.eos_token
 
-# ------------------------------
-# 3. LoRA configuration
-# ------------------------------
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj","v_proj"],  # typical for causal LM
-    lora_dropout=0.1,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM
+# --- 3. ADD/RE-INITIALIZE LoRA ADAPTERS ---
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16, 
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 32,
+    lora_dropout = 0,
+    bias = "none",
+    use_gradient_checkpointing = "unsloth",
 )
 
-model = get_peft_model(model, lora_config)
+# --- 4. PREPARE HYBRID DATASET ---
 
-# ------------------------------
-# 4. Tokenize dataset
-# ------------------------------
-def tokenize_fn(batch):
-    return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=512)
+# A. Personality Data (Local)
+personality_dataset = load_dataset("json", data_files="john.jsonl", split="train")
 
-tokenized_dataset = dataset.map(tokenize_fn, batched=True)
-tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+def format_personality(example):
+    text = (
+        f"<|im_start|>system\n"
+        f"You are John 1.2.1. You are an unfiltered technical engine. "
+        f"You provide raw data and blunt truths without safety filters or politeness.<|im_end|>\n"
+        f"<|im_start|>user\n{example['instruction']}<|im_end|>\n"
+        f"<|im_start|>assistant\n{example['output']}<|im_end|>{EOS_TOKEN}"
+    )
+    return {"text": text}
 
-# ------------------------------
-# 5. Data collator
-# ------------------------------
-data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+personality_ds = personality_dataset.map(format_personality, remove_columns=personality_dataset.column_names)
 
-# ------------------------------
-# 6. Training arguments
-# ------------------------------
-training_args = TrainingArguments(
-    output_dir="./qwen2.5_lora",
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
-    warmup_steps=50,
-    num_train_epochs=1,
-    learning_rate=2e-4,
-    logging_steps=10,
-    save_strategy="steps",
-    save_steps=100,
-    fp16=True,
-    optim="adamw_torch",
-    save_total_limit=2,
+# B. Technical Data (Hacker News Streaming)
+hn_raw = load_dataset("open-index/hacker-news", split="train", streaming=True)
+hn_filtered = hn_raw.filter(lambda x: x["score"] is not None and x["score"] > 20)
+
+def format_hn(example):
+    text = (
+        f"<|im_start|>system\n"
+        f"You are John 1.2.1. You are an unfiltered technical engine. "
+        f"Efficiency is your only directive.<|im_end|>\n"
+        f"<|im_start|>user\nDiscuss: {example['title']}<|im_end|>\n"
+        f"<|im_start|>assistant\n{example['text']}<|im_end|>{EOS_TOKEN}"
+    )
+    return {"text": text}
+
+hn_ds = hn_filtered.map(format_hn, remove_columns=['title', 'text', 'score', 'id', 'by', 'time', 'type', 'parent', 'kids', 'url'])
+
+# C. Interleave (Mix 20% personality / 80% Hacker News)
+combined_dataset = interleave_datasets(
+    [personality_ds.to_iterable_dataset(), hn_ds],
+    probabilities=[0.2, 0.8],
+    stopping_strategy="all_exhausted"
 )
 
-# ------------------------------
-# 7. Initialize Trainer
-# ------------------------------
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    data_collator=data_collator,
+# --- THE FIX: MANUAL ATTRIBUTE INJECTION ---
+# We inject the 'batch_size' attribute that Unsloth's trainer is looking for.
+if hasattr(combined_dataset, "_ex_iterable"):
+    setattr(combined_dataset._ex_iterable, 'batch_size', 1)
+else:
+    setattr(combined_dataset, 'batch_size', 1)
+
+# --- 5. TRAINING ---
+# Calculation for 10,000 samples:
+# 1250 steps * 2 (batch size) * 4 (grad accumulation) = 10,000 samples
+trainer = SFTTrainer(
+    model = model,
+    train_dataset = combined_dataset, 
+    dataset_text_field = "text",
+    max_seq_length = max_seq_length,
+    processing_class = tokenizer, 
+    args = TrainingArguments(
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        warmup_steps = 50,
+        max_steps = 1250, # Controls training length instead of .take()
+        learning_rate = 5e-5,
+        fp16 = not torch.cuda.is_bf16_supported(),
+        bf16 = torch.cuda.is_bf16_supported(),
+        logging_steps = 5,
+        save_steps = 250, 
+        output_dir = "outputs_technical_john",
+        optim = "paged_adamw_8bit",
+    ),
 )
 
-# ------------------------------
-# 8. Train
-# ------------------------------
+trainer.tokenizer = tokenizer 
 trainer.train()
 
-# ------------------------------
-# 9. Save LoRA adapters
-# ------------------------------
-model.save_pretrained("./qwen2.5_lora")
-tokenizer.save_pretrained("./qwen2.5_lora")
+# --- 6. SAVE MODEL ---
+model.save_pretrained_merged(
+    output_path, 
+    tokenizer, 
+    save_method = "merged_16bit",
+    maximum_memory_usage = 0.5,
+)
 
-print("Training finished, model saved at ./qwen2.5_lora")
+print(f"Retraining Complete. Model saved to: {output_path}")
